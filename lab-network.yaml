@@ -1,0 +1,409 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Network Template: Highly available cafe network. VPC with DNS and public IPs enabled,
+  two public and two private subnets in two Availability Zones, an NAT gateway per AZ,
+  and a bastion host that only accepts SSH from the workstation IP parameter.
+
+# This template creates:
+#   VPC
+#   Internet Gateway
+#   Public Route Table + 2 Public Subnets (AZ a, AZ b)
+#   2 Elastic IPs + 2 NAT Gateways (one per AZ)
+#   2 Private Route Tables + 2 Private Subnets (AZ a, AZ b)
+#   Bastion Security Group + Bastion EC2 instance + Elastic IP
+#
+# CHANGE LEGEND: every edit made to the original class lab template is tagged "# CHANGE:".
+
+######################
+# Parameters section
+######################
+
+# CHANGE: the original template had NO Parameters section (everything was hard-coded).
+# Parameters make the template reusable across environments, workstations and CIDR plans.
+Parameters:
+
+  # CHANGE: required by the assignment. Bastion SSH is allowed only from this address.
+  WorkstationIp:
+    Description: >-
+      Public IP address of your workstation in CIDR form (use /32 for one address),
+      for example 203.0.113.25/32. Only this address can SSH to the bastion.
+    Type: String
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be an IPv4 CIDR such as 203.0.113.25/32.
+
+  # CHANGE: key pair is a parameter instead of being hard-coded.
+  KeyName:
+    Description: Name of an existing EC2 key pair used to SSH to the bastion.
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: cafe-app-key
+
+  # CHANGE: prefix used for Name tags so several copies of the stack can be told apart.
+  EnvironmentName:
+    Description: Prefix for resource Name tags.
+    Type: String
+    Default: cafe-cfn
+    AllowedPattern: '^[a-zA-Z][-a-zA-Z0-9]*$'
+
+  # CHANGE: all CIDR blocks were hard-coded (10.0.0.0/16 and 10.0.0.0/24); now parameters.
+  VpcCidr:
+    Description: CIDR block of the VPC.
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  PublicSubnet1Cidr:
+    Description: CIDR block of the public subnet in the first Availability Zone.
+    Type: String
+    Default: 10.0.0.0/24
+
+  PublicSubnet2Cidr:
+    Description: CIDR block of the public subnet in the second Availability Zone.
+    Type: String
+    Default: 10.0.1.0/24
+
+  PrivateSubnet1Cidr:
+    Description: CIDR block of the private (app and database) subnet in the first Availability Zone.
+    Type: String
+    Default: 10.0.2.0/23
+
+  PrivateSubnet2Cidr:
+    Description: CIDR block of the private (app and database) subnet in the second Availability Zone.
+    Type: String
+    Default: 10.0.4.0/23
+
+  # CHANGE: bastion size is a parameter.
+  BastionInstanceType:
+    Description: EC2 instance type of the bastion host.
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+
+  # CHANGE: latest Amazon Linux 2023 AMI looked up from the public SSM parameter
+  # (AL2023 has the dnf package mariadb105 used to test the database from the bastion).
+  BastionAmiId:
+    Description: Latest Amazon Linux 2023 AMI (resolved by CloudFormation from SSM).
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+######################
+# Resources section
+######################
+
+Resources:
+
+  ## VPC
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: !Ref VpcCidr # CHANGE: was hard-coded 10.0.0.0/16
+      # CHANGE: added Name tag
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpc
+
+  ## Internet Gateway
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    # CHANGE: added Name tag
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-igw
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  ## Public Route Table
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      # CHANGE: added Name tag
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  ## Public Subnets
+
+  # CHANGE: the original PublicSubnet was renamed PublicSubnet1 (AZ a) and a second public
+  # subnet (PublicSubnet2, AZ b) was added, because the ALB needs subnets in two AZs.
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1Cidr # CHANGE: was hard-coded 10.0.0.0/24
+      MapPublicIpOnLaunch: true # CHANGE: added so public instances get a public IP
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+          Ref: AWS::Region
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-1
+
+  PublicSubnet2: # CHANGE: new resource
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs
+          Ref: AWS::Region
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-2
+
+  PublicSubnet1RouteTableAssociation: # CHANGE: renamed from PublicSubnetRouteTableAssociation
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation: # CHANGE: new resource
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet1NetworkAclAssociation: # CHANGE: renamed from PublicSubnetNetworkAclAssociation
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      NetworkAclId: !GetAtt
+        - VPC
+        - DefaultNetworkAcl
+
+  PublicSubnet2NetworkAclAssociation: # CHANGE: new resource
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      NetworkAclId: !GetAtt
+        - VPC
+        - DefaultNetworkAcl
+
+  ## NAT Gateways (one per AZ so a single AZ failure does not cut off the other AZ)
+  # CHANGE: entire NAT section is new. Private instances use the NAT to reach the
+  # internet (yum, AWS APIs such as SSM).
+
+  NatEip1:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat-eip-1
+
+  NatEip2:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat-eip-2
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat-1
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat-2
+
+  ## Private Subnets and Route Tables
+  # CHANGE: entire private tier is new (app servers and RDS live here).
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+          Ref: AWS::Region
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs
+          Ref: AWS::Region
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-2
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-rt-1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-rt-2
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+  ## Bastion host
+  # CHANGE: entire bastion section is new. The bastion security group is in this stack
+  # (not the application stack) so the application stack can import it for SSH rules.
+
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SSH to the bastion from the workstation only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref WorkstationIp # CHANGE: the workstation IP parameter, never 0.0.0.0/0
+          Description: SSH from workstation
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-bastion-sg
+
+  BastionInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref BastionInstanceType
+      ImageId: !Ref BastionAmiId
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      MetadataOptions:
+        HttpTokens: required # IMDSv2 only
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-bastion
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          # MariaDB client so the bastion can reach the private RDS instance
+          dnf -y install mariadb105
+
+  BastionEip:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref BastionInstance # stable public address for SSH
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-bastion-eip
+
+######################
+# Outputs section
+######################
+
+Outputs:
+
+  # CHANGE: original exported PublicSubnet as '${AWS::StackName}-SubnetID'. That export is
+  # replaced by the explicit per-subnet exports below (the application stack now needs
+  # 2 public + 2 private subnets).
+  PublicSubnet1:
+    Description: Public subnet ID in the first AZ
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet1ID'
+
+  PublicSubnet2:
+    Description: Public subnet ID in the second AZ
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet2ID'
+
+  PrivateSubnet1:
+    Description: Private subnet ID in the first AZ
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1ID'
+
+  PrivateSubnet2:
+    Description: Private subnet ID in the second AZ
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2ID'
+
+  VPC:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCID'
+
+  BastionSecurityGroup:
+    Description: Bastion security group ID (app servers allow SSH from it)
+    Value: !Ref BastionSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-BastionSGID'
+
+  BastionPublicIp:
+    Description: Public IP address of the bastion (ssh -i key ec2-user@this)
+    Value: !Ref BastionEip
